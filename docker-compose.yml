@@ -1,11 +1,16 @@
 # 化学反应计量平衡服务 —— Docker Compose 编排。
 #
-# 构建并后台启动（首次或代码更新后）：
+# 一条命令构建并后台启动（首次或代码更新后）：
 #   docker compose up --build -d
 # 查看日志 / 停止：
 #   docker compose logs -f
 #   docker compose down
-# 容器内服务监听 8000，映射到宿主机同端口；健康检查见下方 healthcheck。
+#
+# 容器内服务默认监听 8000，映射到宿主机同端口。
+# 如需改宿主机端口，设置环境变量 HOST_PORT（无需改本文件）：
+#   HOST_PORT=9000 docker compose up --build -d
+# 如需同时改容器内监听端口，设置 APP_PORT（须与映射右侧一致）：
+#   HOST_PORT=9000 APP_PORT=9000 docker compose up --build -d
 name: reaction-balancer
 
 services:
@@ -14,11 +19,14 @@ services:
     image: reaction-balancer:latest
     container_name: reaction-balancer
     ports:
-      # 宿主机 8000 -> 容器 8000；如需改端口，修改冒号左侧即可
-      - "8000:8000"
+      # 宿主机 ${HOST_PORT:-8000} -> 容器 ${APP_PORT:-8000}
+      - "${HOST_PORT:-8000}:${APP_PORT:-8000}"
+    environment:
+      # 容器内监听端口；入口脚本初始化自检后以该端口启动 uvicorn
+      APP_PORT: "${APP_PORT:-8000}"
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).status==200 else 1)"]
+      test: ["CMD", "python", "-c", "import os,urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:%d/health' % int(os.environ.get('APP_PORT', '8000')), timeout=3).status==200 else 1)"]
       interval: 30s
       timeout: 5s
       retries: 3

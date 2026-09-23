@@ -10,6 +10,12 @@
   * 每种反应物的消耗量（ξ·系数）与剩余量（投料量 − 消耗量）；
   * 每种生成物的理论产量（ξ·系数）。
 
+* 收率核算（投料 + 实际产出 -> 收率百分比）：:func:`compute_yields`
+  在 :func:`compute_stoichiometry` 的反应进度与理论产量之上，对每种生成物
+  以实际摩尔量计算收率百分比 = 实际 ÷ 理论 × 100；理论产量为 0（投料全
+  为 0）时收率返回 ``None`` 并给出原因；实际产量高于理论值时保留 > 100%
+  的结果，不做截断。
+
 * 多步连续反应推演：:func:`apply_sequence_step`
   给定唯一配平后的一步反应与当前库存（物种规范键 -> 非负 :class:`Fraction`
   摩尔数），以该步全部反应物的当前库存（缺省视为 0）计算最大反应进度
@@ -143,6 +149,21 @@ def fraction_to_decimal_string(value: Fraction) -> str:
     return _fixed_point(decimal_value)
 
 
+def _limiting_extent(
+    reactants: list[Species],
+    coefficients: dict[str, int],
+    feed_fractions: dict[str, Fraction],
+) -> tuple[Fraction, set[str]]:
+    """由反应物投料量计算反应进度 ξ = min(投料量 ÷ 系数) 与并列限量试剂集合。"""
+    ratios: dict[str, Fraction] = {
+        species_key(sp): feed_fractions[species_key(sp)] / coefficients[species_key(sp)]
+        for sp in reactants
+    }
+    extent = min(ratios.values())
+    limiting = {key for key, ratio in ratios.items() if ratio == extent}
+    return extent, limiting
+
+
 def compute_stoichiometry(
     reactants: Iterable[Species],
     products: Iterable[Species],
@@ -162,13 +183,7 @@ def compute_stoichiometry(
     feed_fractions = {key: decimal_to_fraction(amount) for key, amount in feed.items()}
 
     # 反应进度 ξ = min(投料量 / 系数)
-    ratios: dict[str, Fraction] = {
-        species_key(sp): feed_fractions[species_key(sp)]
-        / coefficients[species_key(sp)]
-        for sp in reactants
-    }
-    extent = min(ratios.values())
-    limiting = {key for key, ratio in ratios.items() if ratio == extent}
+    extent, limiting = _limiting_extent(reactants, coefficients, feed_fractions)
 
     reactant_blocks: list[dict] = []
     for sp in reactants:
@@ -211,6 +226,89 @@ def compute_stoichiometry(
         "limiting_reactants": [block["normalized"] for block in reactant_blocks
                                if block["is_limiting"]],
         "reactants": reactant_blocks,
+        "products": product_blocks,
+    }
+
+
+# 理论产量为 0 时收率不可计算的原因说明（随每个产物的 yield_percent=null 返回）
+ZERO_YIELD_REASON = (
+    "理论产量为 0：反应物投料量全部为 0，反应进度 ξ = 0，无法以实际产量 "
+    "÷ 理论产量计算收率百分比"
+)
+
+
+def compute_yields(
+    reactants: Iterable[Species],
+    products: Iterable[Species],
+    coefficients: dict[str, int],
+    feed: dict[str, Decimal],
+    actual: dict[str, Decimal],
+    actual_raw: dict[str, str] | None = None,
+) -> dict:
+    """投料量 + 各生成物实际摩尔量 -> 理论产量、实际产量与收率百分比。
+
+    先与 :func:`compute_stoichiometry` 完全一致地求出反应进度与各生成物
+    理论产量；再逐种生成物按
+
+        收率百分比 = 实际产量 ÷ 理论产量 × 100
+
+    以精确有理数计算（全程不经过 ``float``），仅在输出时渲染为十进制字符串：
+    有限小数给出精确值，无限小数按 28 位有效数字银行家舍入。
+
+    * 理论产量为 0（反应进度为 0，即所有反应物投料均为 0）时，收率在数学
+      上无定义，``yield_percent`` 返回 ``None`` 并在 ``yield_percent_reason``
+      中说明原因；
+    * 实际产量高于理论产量时**保留**大于 100% 的结果（不做任何截断或封顶），
+      以反映称量/分离等实验误差。
+
+    ``actual`` / ``actual_raw`` 以 :func:`app.cache.species_key` 为键，
+    ``actual`` 必须覆盖全部生成物且值非负；``actual_raw`` 缺省时回显规范化
+    化学式。物种按规范键排序输出。
+    """
+    actual_raw = actual_raw or {}
+    reactants = sorted(reactants, key=lambda sp: sp.formula.key)
+    products = sorted(products, key=lambda sp: sp.formula.key)
+
+    feed_fractions = {key: decimal_to_fraction(amount) for key, amount in feed.items()}
+    actual_fractions = {
+        key: decimal_to_fraction(amount) for key, amount in actual.items()
+    }
+
+    extent, limiting = _limiting_extent(reactants, coefficients, feed_fractions)
+
+    product_blocks: list[dict] = []
+    for sp in products:
+        key = species_key(sp)
+        coef = coefficients[key]
+        theoretical = extent * coef
+        produced = actual_fractions[key]
+        if theoretical == 0:
+            percent_text: str | None = None
+            reason: str | None = ZERO_YIELD_REASON
+        else:
+            percent = produced * 100 / theoretical
+            percent_text = fraction_to_decimal_string(percent)
+            reason = None
+        product_blocks.append(
+            {
+                "input": actual_raw.get(key, sp.normalized),
+                "normalized": sp.normalized,
+                "coefficient": coef,
+                "theoretical_yield": fraction_to_decimal_string(theoretical),
+                "actual_yield": fraction_to_decimal_string(produced),
+                "yield_percent": percent_text,
+                "yield_percent_reason": reason,
+            }
+        )
+
+    return {
+        "reaction_extent": {
+            "value": fraction_to_decimal_string(extent),
+            "unit": "mol",
+        },
+        "limiting_reactants": [
+            sp.normalized for sp in reactants if species_key(sp) in limiting
+        ],
         "products": product_blocks,
     }
 

@@ -7,6 +7,9 @@
 * ``POST /analyze``          逐元素差异说明（配平前 + 配平后视图）；
 * ``POST /stoichiometry/batch`` 投料摩尔数 -> 反应进度、并列限量试剂、
   各反应物消耗/剩余与各生成物理论产量；
+* ``POST /stoichiometry/yield`` 投料摩尔数 + 各生成物实际摩尔量 ->
+  逐种生成物理论产量、实际产量与收率百分比（理论产量为 0 时收率 null，
+  实际高于理论时保留 > 100%）；
 * ``POST /stoichiometry/plan``  生成物目标摩尔数 -> 最小反应进度、
   各反应物理论需求量、各目标产物达成量与超额量；
 * ``POST /stoichiometry/sequence`` 多步连续反应推演：按顺序执行多步
@@ -40,6 +43,8 @@ from .models import (
     StoichiometryRequest,
     VariantRequest,
     VariantsResponse,
+    YieldRequest,
+    YieldResponse,
 )
 from .service import (
     STATUS_CODES,
@@ -51,6 +56,7 @@ from .service import (
     process_sequence,
     process_stoichiometry,
     process_variants,
+    process_yield,
 )
 
 app = FastAPI(
@@ -156,6 +162,27 @@ async def stoichiometry_batch(request: StoichiometryRequest):
         request.reactants,
         request.products,
         [item.model_dump() for item in request.amounts],
+    )
+    return JSONResponse(status_code=status, content=payload)
+
+
+@app.post(
+    "/api/v1/stoichiometry/yield",
+    response_model=YieldResponse,
+    tags=["计量"],
+    summary="收率核算：投料与实际产量 -> 逐种生成物理论/实际产量与收率百分比",
+    responses={
+        400: {"description": "化学式解析失败"},
+        409: {"description": "同侧重复物种 / 投料或实际产量重复"},
+        422: {"description": "无法唯一配平 / 投料或实际产量与反应物种不对应 / 摩尔数非法"},
+    },
+)
+async def stoichiometry_yield(request: YieldRequest):
+    status, payload = process_yield(
+        request.reactants,
+        request.products,
+        [item.model_dump() for item in request.amounts],
+        [item.model_dump() for item in request.actual_yields],
     )
     return JSONResponse(status_code=status, content=payload)
 
