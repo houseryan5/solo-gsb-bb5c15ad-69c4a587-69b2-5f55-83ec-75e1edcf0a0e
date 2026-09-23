@@ -31,6 +31,7 @@ from .stoichiometry import (
     apply_sequence_step,
     compute_reverse_plan,
     compute_stoichiometry,
+    compute_yields,
     decimal_to_fraction,
     fraction_to_decimal_string,
     parse_moles,
@@ -416,6 +417,61 @@ def process_variants(
 
 
 # ------------------------------------------------------------ 限量试剂批量计量
+def _parse_species_moles(
+    items: list[dict[str, str]], field_name: str
+) -> tuple[
+    list[tuple[str, Species]],
+    list[tuple[str, Species]],
+    list[dict[str, str]],
+    list[str],
+]:
+    """把 ``[{species, moles}]`` 条目解析为精确 Decimal，聚合可定位的问题。
+
+    返回 ``(有效条目, 可解析物种条目, 非法摩尔条目, 重复规范化物种)``：
+
+    * 有效条目 ``(原始摩尔文本, 物种, Decimal 摩尔数)``：物种可解析且摩尔数合法；
+    * 可解析物种条目 ``(原始摩尔文本, 物种)`` 还包含摩尔数非法的记录，
+      供匹配未知物种/缺失物种时不遗漏；
+    * 物种本身无法解析时抛出 :class:`BalanceError`（FORMULA_PARSE_ERROR），
+      由调用方按 ``field_name`` 组装 400 响应；
+    * 摩尔数非法 / 物种重复不在此报错，由调用方聚合成 422 响应。
+    """
+    parsed_entries: list[tuple[str, Species, Decimal]] = []
+    parseable_entries: list[tuple[str, Species]] = []
+    invalid_moles: list[dict[str, str]] = []
+    duplicate: list[str] = []
+    seen_keys: set[str] = set()
+
+    for item in items:
+        species_text = item["species"]
+        moles_text = item["moles"]
+        try:
+            formula = parse_formula(species_text)
+        except FormulaError as exc:
+            raise BalanceError(
+                "FORMULA_PARSE_ERROR",
+                str(exc),
+                field=field_name,
+                input=species_text,
+            ) from exc
+        sp = Species(raw=species_text, normalized=formula.normalized, formula=formula)
+        parseable_entries.append((moles_text, sp))
+
+        key = species_key(sp)
+        if key in seen_keys:
+            duplicate.append(formula.normalized)
+        seen_keys.add(key)
+
+        try:
+            amount = parse_moles(moles_text)
+        except (ValueError, InvalidOperation):
+            invalid_moles.append({"species": formula.normalized, "moles": moles_text})
+        else:
+            parsed_entries.append((moles_text, sp, amount))
+
+    return parsed_entries, parseable_entries, invalid_moles, duplicate
+
+
 def process_stoichiometry(
     reactant_texts: list[str],
     product_texts: list[str],
@@ -515,6 +571,132 @@ def process_stoichiometry(
         }
 
     result = compute_stoichiometry(reactants, products, coefficient_map, feed)
+    return 200, {
+        "reaction_id": reaction_id,
+        "cached": cached,
+        "normalized": balance_payload["normalized"],
+        **result,
+    }
+
+
+# ------------------------------------------------------------ 实际收率
+def process_yield(
+    reactant_texts: list[str],
+    product_texts: list[str],
+    amount_items: list[dict[str, str]],
+    actual_items: list[dict[str, str]],
+) -> tuple[int, dict[str, Any]]:
+    """实际收率计算，返回 (http_status, payload)。
+
+    先复用 :func:`process_balance` 的唯一配平、规范化与幂等缓存逻辑；
+    配平失败沿用其结构化错误响应。随后校验投料与规范化反应物一一对应、
+    实际产量与规范化生成物一一对应（语义同
+    :func:`process_stoichiometry`，错误明细分别以 ``amounts.`` /
+    ``actual_yields.`` 为前缀），再复用 :func:`compute_stoichiometry`
+    的反应进度精确计算，逐种给出理论产量、实际产量与收率百分比；
+    理论产量为 0 时收率返回 null 并说明零投料的限量反应物，实际产量
+    高于理论值时保留大于 100% 的结果。
+    """
+    status, balance_payload = process_balance(reactant_texts, product_texts)
+    if status != 200:
+        return status, balance_payload
+
+    reaction_id = balance_payload["reaction_id"]
+    cached = balance_payload["cached"]
+
+    # parse_side 已按规范键排序，与配平向量顺序一致
+    reactants = list(parse_side(reactant_texts, "反应物"))
+    products = list(parse_side(product_texts, "生成物"))
+    coefficient_map = {
+        species_key(sp): coef
+        for sp, coef in zip(
+            (*reactants, *products), balance_payload["coefficients"]["vector"]
+        )
+    }
+    reactant_keys = {species_key(sp) for sp in reactants}
+    product_keys = {species_key(sp) for sp in products}
+
+    try:
+        feed_entries, feed_parseable, feed_invalid, feed_duplicate = (
+            _parse_species_moles(amount_items, "amounts.species")
+        )
+        actual_entries, actual_parseable, actual_invalid, actual_duplicate = (
+            _parse_species_moles(actual_items, "actual_yields.species")
+        )
+    except BalanceError as exc:
+        return STATUS_CODES[exc.code], {
+            "reaction_id": reaction_id,
+            "cached": cached,
+            "error": error_payload(exc.code, exc.message, dict(exc.details)),
+        }
+
+    # ---- 投料侧（与 /stoichiometry/batch 相同的一一对应语义）
+    feed_unknown = sorted(
+        {sp.normalized for _, sp in feed_parseable
+         if species_key(sp) not in reactant_keys}
+    )
+    feed_provided = {species_key(sp) for _, sp, _ in feed_entries}
+    reactant_names = {species_key(sp): sp.normalized for sp in reactants}
+    feed_missing = [
+        reactant_names[key] for key in reactant_keys if key not in feed_provided
+    ]
+
+    # ---- 实际产量侧
+    actual_unknown = sorted(
+        {sp.normalized for _, sp in actual_parseable
+         if species_key(sp) not in product_keys}
+    )
+    actual_provided = {species_key(sp) for _, sp, _ in actual_entries}
+    product_names = {species_key(sp): sp.normalized for sp in products}
+    actual_missing = [
+        product_names[key] for key in product_keys if key not in actual_provided
+    ]
+
+    if (
+        feed_duplicate or feed_unknown or feed_missing or feed_invalid
+        or actual_duplicate or actual_unknown or actual_missing or actual_invalid
+    ):
+        details: dict[str, Any] = {}
+        if feed_missing:
+            details["missing"] = sorted(feed_missing)
+        if feed_duplicate:
+            details["duplicate"] = sorted(set(feed_duplicate))
+        if feed_unknown:
+            details["unknown"] = feed_unknown
+        if feed_invalid:
+            details["invalid_moles"] = feed_invalid
+        if actual_missing:
+            details["actual_yields.missing"] = sorted(actual_missing)
+        if actual_duplicate:
+            details["actual_yields.duplicate"] = sorted(set(actual_duplicate))
+        if actual_unknown:
+            details["actual_yields.unknown"] = actual_unknown
+        if actual_invalid:
+            details["actual_yields.invalid_moles"] = actual_invalid
+        return STATUS_CODES["INVALID_REQUEST"], {
+            "reaction_id": reaction_id,
+            "cached": cached,
+            "error": error_payload(
+                "INVALID_REQUEST",
+                "投料记录必须与规范化反应物一一对应，实际产量记录必须与规范化"
+                "生成物一一对应：均不能有缺失、重复或未知物种，且每条摩尔数必须"
+                "是非负十进制字符串（不能为 JSON 数字）",
+                details,
+            ),
+        }
+
+    feed: dict[str, Decimal] = {}
+    for _moles_text, sp, amount in feed_entries:
+        feed[species_key(sp)] = amount
+    actual: dict[str, Decimal] = {}
+    actual_raw: dict[str, str] = {}
+    for _moles_text, sp, amount in actual_entries:
+        actual[species_key(sp)] = amount
+        actual_raw[species_key(sp)] = sp.raw
+
+    result = compute_yields(
+        reactants, products, coefficient_map, feed, actual, actual_raw
+    )
     return 200, {
         "reaction_id": reaction_id,
         "cached": cached,

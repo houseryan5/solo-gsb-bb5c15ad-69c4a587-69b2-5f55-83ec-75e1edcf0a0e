@@ -219,6 +219,76 @@ class StoichiometryResponse(BaseModel):
     products: list[StoichProductResult]
 
 
+# ------------------------------------------------------------ 实际收率
+class ActualYield(StoichAmount):
+    """一条生成物实际摩尔产量记录；复用非负十进制字符串摩尔数校验。"""
+
+    species: str = Field(
+        ...,
+        min_length=1,
+        description="生成物化学式；必须与规范化后的生成物一一对应（等价写法可识别）",
+        examples=["H2O"],
+    )
+    moles: str = Field(
+        ...,
+        min_length=1,
+        description="该生成物的**实际**摩尔产量（非负十进制字符串，如 \"1.5\"、"
+        "\"0\"、\"1e-3\"），允许高于理论值；不要传 JSON 数字以避免浮点误差",
+        examples=["1.8"],
+    )
+
+
+class YieldRequest(ReactionRequest):
+    """``/stoichiometry/yield`` 请求：反应式 + 各反应物投料 + 各生成物实际产量。"""
+
+    amounts: list[StoichAmount] = Field(
+        ...,
+        min_length=1,
+        description="每种反应物一条投料记录；数量必须恰好等于规范化反应物数量，"
+        "且 species 一一对应（无缺失、重复、未知物种）",
+    )
+    actual_yields: list[ActualYield] = Field(
+        ...,
+        min_length=1,
+        description="每种生成物一条实际产量记录；数量必须恰好等于规范化生成物"
+        "数量，且 species 一一对应（无缺失、重复、未知物种）；实际产量允许为 0 "
+        "或高于理论值",
+    )
+
+
+class YieldProductResult(BaseModel):
+    input: str = Field(description="客户端提交的原始生成物化学式")
+    normalized: str = Field(description="规范化后的化学式")
+    coefficient: int = Field(description="最小互质正整数配平系数")
+    theoretical_yield: str = Field(
+        description="理论产量 = 反应进度 × 系数（mol）"
+    )
+    actual_yield: str = Field(description="客户端提交的实际产量（mol，回显）")
+    yield_percent: str | None = Field(
+        description="收率百分比 = 实际产量 ÷ 理论产量 × 100（十进制字符串，"
+        "不封顶，实际高于理论时大于 100）；理论产量为 0 时为 null"
+    )
+    yield_note: str | None = Field(
+        default=None,
+        description="收率无法计算时的说明（理论产量为 0 时给出零投料限量反应物）；"
+        "正常计算时为 null",
+    )
+
+
+class YieldResponse(BaseModel):
+    reaction_id: str
+    cached: bool = Field(description="配平结果是否命中幂等缓存")
+    normalized: NormalizedReaction
+    reaction_extent: ReactionExtent
+    limiting_reactants: list[str] = Field(
+        description="全部并列限量试剂的规范化化学式（投料比恰好等于系数比时多于一个）"
+    )
+    reactants: list[StoichReactantResult]
+    products: list[YieldProductResult] = Field(
+        description="逐种生成物的理论产量、实际产量与收率百分比"
+    )
+
+
 # ------------------------------------------------------------ 反向投料规划
 class ReversePlanTarget(StoichAmount):
     """反向规划的一条目标产物记录；复用非负十进制字符串摩尔数校验。"""

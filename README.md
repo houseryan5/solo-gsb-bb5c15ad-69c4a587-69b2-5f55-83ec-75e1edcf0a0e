@@ -14,15 +14,19 @@
 6. `/stoichiometry/plan` 做反向投料规划：按一个或多个生成物的目标摩尔数，
    取各目标量/配平系数的最大值得到满足全部目标的最小反应进度，给出各反应物
    理论需求量、各目标产物达成量与超额量；
-7. `/stoichiometry/sequence` 做连续反应推演：按顺序执行多步反应，从初始
+7. `/stoichiometry/yield` 计算实际收率：提交各反应物投料摩尔数与每种生成物
+   的实际摩尔产量，复用唯一配平与精确计量逻辑计算反应进度与理论产量，逐种
+   返回理论产量、实际产量与收率百分比（理论产量为 0 时收率返回 `null` 并说明
+   原因，实际产量高于理论值时保留大于 100% 的结果）；
+8. `/stoichiometry/sequence` 做连续反应推演：按顺序执行多步反应，从初始
    物种摩尔库存出发，每步以全部反应物的当前库存计算最大反应进度，扣减消耗、
    加入产物并把更新后的库存传给下一步（库存不足则该步零进度继续并标出全部
    阻塞反应物），全程精确有理数运算；
-8. `/inventory/allocate` 做试剂批次 **FEFO 领用分配**：提交待领用物种的有效
+9. `/inventory/allocate` 做试剂批次 **FEFO 领用分配**：提交待领用物种的有效
    摩尔需求与带批号/纯度/名义摩尔数/失效日期/状态的库存批次及核算日期，
    服务按失效日期优先、同日批号升序跨批次扣减（名义量 × 纯度换算有效物质），
    跳过已过期与隔离批次，返回每批领用/余量、未满足需求与汇总状态；
-9. 对同一规范化反应做幂等缓存，重复请求返回相同的 `reaction_id` 与结果。
+10. 对同一规范化反应做幂等缓存，重复请求返回相同的 `reaction_id` 与结果。
 
 ---
 
@@ -69,6 +73,16 @@ curl -X POST http://localhost:8000/api/v1/stoichiometry/plan \
        "targets":[{"species":"NH3","moles":"4"}]}'
 ```
 
+实际收率——按投料与实际产出的 NH₃ 计算理论产量与收率百分比：
+
+```bash
+curl -X POST http://localhost:8000/api/v1/stoichiometry/yield \
+  -H 'Content-Type: application/json' \
+  -d '{"reactants":["N2","H2"],"products":["NH3"],
+       "amounts":[{"species":"N2","moles":"1"},{"species":"H2","moles":"3"}],
+       "actual_yields":[{"species":"NH3","moles":"1.5"}]}'
+```
+
 试剂批次领用分配——按失效日期优先（FEFO）跨批领用 1.5 mol 有效 HCl：
 
 ```bash
@@ -100,7 +114,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ```bash
 pip install -r requirements-dev.txt
-pytest          # 241 个测试
+pytest          # 267 个测试
 ```
 
 ---
@@ -114,6 +128,7 @@ pytest          # 241 个测试
 | POST | `/api/v1/analyze` | 逐元素差异说明：配平前（单位系数）与配平后两个视图 |
 | POST | `/api/v1/stoichiometry/batch` | 投料摩尔数批量计量：反应进度、并列限量试剂、消耗/剩余与理论产量 |
 | POST | `/api/v1/stoichiometry/plan` | 反向投料规划：按生成物目标摩尔数求最小反应进度、理论投料需求与达成/超额量 |
+| POST | `/api/v1/stoichiometry/yield` | 实际收率：投料摩尔数与各生成物实际产量 → 逐种理论产量、实际产量与收率百分比 |
 | POST | `/api/v1/stoichiometry/sequence` | 连续反应推演：多步反应按顺序消耗/产出，逐步传递库存，返回各步明细与最终库存 |
 | POST | `/api/v1/inventory/allocate` | 试剂批次 FEFO 领用分配：按失效日期优先、同日批号升序跨批次扣减，跳过过期/隔离批次，返回每批领用/余量、未满足需求与汇总状态 |
 | GET | `/api/v1/reactions/{reaction_id}` | 按幂等 ID 取回之前的结果 |
@@ -416,7 +431,97 @@ curl -X POST http://localhost:8000/api/v1/stoichiometry/plan \
 | 摩尔数非法：负数、`NaN`、`Infinity`、非数字字符串或 JSON 数字（详情 `details.invalid_moles`） | `422 INVALID_REQUEST` |
 | 反应无法唯一配平 / 无法配平 | `422 NON_UNIQUE_BALANCE` / `IMPOSSIBLE_BALANCE` 等 |
 
-### 2.6 连续反应推演 `POST /api/v1/stoichiometry/sequence`
+### 2.6 实际收率 `POST /api/v1/stoichiometry/yield`
+
+提交反应式、**每种反应物的投料摩尔数**（`amounts`，与
+`/stoichiometry/batch` 完全一致的一一对应要求）以及**每种生成物的实际
+摩尔产量**（`actual_yields`，同样与规范化生成物一一对应）。服务端复用
+唯一配平与精确计量逻辑：
+
+* 反应进度 ξ = min(**投料量 ÷ 配平系数**)、并列限量试剂与各反应物
+  消耗/剩余，计算过程与结果同 `/stoichiometry/batch` 完全一致；
+* 每种生成物的**理论产量** = ξ·系数、**实际产量**（回显请求值）与
+  **收率百分比** = 实际产量 ÷ 理论产量 × 100；
+* 物种按规范化签名匹配：`H2 O`、`[H]2` 等等价写法会识别为同一物种
+  （`input` 回显原始写法，`normalized` 为规范化化学式）；
+* 理论产量为 **0**（ξ = 0，即至少一种反应物投料为 0）时收率无定义，
+  `yield_percent` 返回 `null`，并在 `yield_note` 中说明原因及投料为 0
+  的全部限量反应物；
+* 实际产量高于理论值时**不做封顶**，`yield_percent` 保留大于 100 的结果
+  （如 125），请结合实验误差自行判断；
+* 全程精确有理数运算（不经过 `float`），无限小数按 28 位有效数字
+  银行家舍入输出，规则同其它计量接口。
+
+```bash
+curl -X POST http://localhost:8000/api/v1/stoichiometry/yield \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "reactants": ["N2", "H2"],
+    "products": ["NH3"],
+    "amounts": [
+      {"species": "N2", "moles": "1"},
+      {"species": "H2", "moles": "3"}
+    ],
+    "actual_yields": [
+      {"species": "NH3", "moles": "1.5"}
+    ]
+  }'
+```
+
+`N2 + 3H2 -> 2NH3`、ξ = 1 时理论 NH₃ = 2 mol，实际 1.5 mol，收率 75%：
+
+```json
+{
+  "reaction_id": "rxn_……",
+  "cached": false,
+  "normalized": {
+    "reactants": ["H2", "N2"],
+    "products": ["NH3"],
+    "equation": "N2 + 3H2 -> 2NH3"
+  },
+  "reaction_extent": {"value": "1", "unit": "mol"},
+  "limiting_reactants": ["N2"],
+  "reactants": [
+    {"input": "H2", "normalized": "H2", "coefficient": 3,
+     "fed": "3", "consumed": "3", "remaining": "0", "is_limiting": false},
+    {"input": "N2", "normalized": "N2", "coefficient": 1,
+     "fed": "1", "consumed": "1", "remaining": "0", "is_limiting": true}
+  ],
+  "products": [
+    {"input": "NH3", "normalized": "NH3", "coefficient": 2,
+     "theoretical_yield": "2", "actual_yield": "1.5",
+     "yield_percent": "75", "yield_note": null}
+  ]
+}
+```
+
+零投料导致理论产量为 0 的示例（N2 投料 `"0"`）：
+
+```json
+"products": [
+  {"input": "NH3", "normalized": "NH3", "coefficient": 2,
+   "theoretical_yield": "0", "actual_yield": "0",
+   "yield_percent": null,
+   "yield_note": "理论产量为 0：反应进度 ξ = min(投料量 ÷ 系数) = 0，投料为 0 的限量反应物为 ['N2']，收率百分比无定义"}
+]
+```
+
+错误结构与 `/stoichiometry/batch` 一致，投料侧问题沿用
+`details.missing/duplicate/unknown/invalid_moles`，实际产量侧问题以
+`actual_yields.` 前缀聚合：
+
+| 场景 | HTTP / code |
+| --- | --- |
+| 反应式、投料或实际产量物种无法解析（`details.field` 指出 `amounts.species` / `actual_yields.species`） | `400 FORMULA_PARSE_ERROR` |
+| 反应式同侧物种重复 | `409 DUPLICATE_SPECIES` |
+| 投料缺失/重复/含未知物种（详情 `details.missing/duplicate/unknown`） | `422 INVALID_REQUEST` |
+| 实际产量缺失/重复/含非生成物物种（详情 `details.actual_yields.missing/duplicate/unknown`） | `422 INVALID_REQUEST` |
+| 任一侧摩尔数非法：负数、`NaN`、`Infinity`、非数字字符串或 JSON 数字 | `422 INVALID_REQUEST` |
+| 反应无法唯一配平 / 无法配平 | `422 NON_UNIQUE_BALANCE` / `IMPOSSIBLE_BALANCE` 等 |
+
+`reaction_id` 与其它计量接口共享同一规范化签名。
+
+### 2.7 连续反应推演 `POST /api/v1/stoichiometry/sequence`
 
 给定**按顺序执行的多步反应**与**初始物种摩尔库存**，服务端逐步推演：
 
@@ -536,7 +641,7 @@ curl -X POST http://localhost:8000/api/v1/stoichiometry/sequence \
 | `steps` 为空、缺字段、化学式为空白等请求体问题 | `422 INVALID_REQUEST` |
 | 初始库存摩尔数非法（详情 `details.invalid_moles`） | `422 INVALID_REQUEST` |
 
-### 2.7 试剂批次领用分配 `POST /api/v1/inventory/allocate`
+### 2.8 试剂批次领用分配 `POST /api/v1/inventory/allocate`
 
 提交**待领用物种的有效摩尔需求**、一组库存批次（批号、纯度、可用名义摩尔数、
 失效日期、状态）与**核算日期**，服务按 FEFO（先到期先出）规则分配：
@@ -659,7 +764,7 @@ curl -X POST http://localhost:8000/api/v1/stoichiometry/sequence \
 该接口为无状态计算（不读写幂等缓存、不持久化扣减结果）；同一请求重复调用
 得到完全一致的分配。
 
-### 2.8 幂等与查询
+### 2.9 幂等与查询
 
 * 幂等键与书写顺序、括号风格、空白以及电荷的等价写法无关，只取决于每一侧
   物种的 **（元素组成多重集, 电荷）**。
@@ -731,7 +836,7 @@ LCM），热循环只剩整数乘加；自由变量最多 3 个、系数上限 3
 | --- | --- | --- |
 | `FORMULA_PARSE_ERROR` | 400 | 化学式无法解析（未知元素、括号不匹配、电荷非法等） |
 | `DUPLICATE_SPECIES` | 409 | 同一侧出现重复物种 |
-| `INVALID_REQUEST` | 422 | 请求体缺失/为空/物种过多（>100）；`/stoichiometry/batch` 投料缺失、重复、含未知物种或摩尔数非法（含 JSON 数字）；`/stoichiometry/plan` 目标重复、含非生成物物种或摩尔数非法；`/stoichiometry/sequence` 步骤为空、库存摩尔数非法（结构化错误的 `details.step` 另标出出错步骤）；`/inventory/allocate` 请求体结构问题（缺字段、空列表、日期格式错误、状态枚举非法、数字代替十进制字符串等） |
+| `INVALID_REQUEST` | 422 | 请求体缺失/为空/物种过多（>100）；`/stoichiometry/batch` 投料缺失、重复、含未知物种或摩尔数非法（含 JSON 数字）；`/stoichiometry/plan` 目标重复、含非生成物物种或摩尔数非法；`/stoichiometry/yield` 投料或实际产量缺失/重复/含未知物种或任一侧摩尔数非法（实际产量侧问题在 `details.actual_yields.*`）；`/stoichiometry/sequence` 步骤为空、库存摩尔数非法（结构化错误的 `details.step` 另标出出错步骤）；`/inventory/allocate` 请求体结构问题（缺字段、空列表、日期格式错误、状态枚举非法、数字代替十进制字符串等） |
 | `IMPOSSIBLE_BALANCE` | 422 | 守恒方程组无解（含电荷无法守恒） |
 | `NON_UNIQUE_BALANCE` | 422 | 零空间维数 > 1，配平不唯一（返回 `nullity` 与自由度） |
 | `ZERO_COEFFICIENT` | 422 | 唯一解要求某些物种系数为 0 |
@@ -761,12 +866,12 @@ app/
   parser.py         递归下降化学式解析（元素/括号/电荷/电子）
   balancer.py       守恒矩阵、有理数 RREF、零空间、最小正整数、多变体枚举、守恒视图
   cache.py          规范化签名（SHA-256）与 LRU 幂等缓存
-  stoichiometry.py  投料量 -> 反应进度（正向批量计量）、目标产量 -> 最小反应进度/理论投料（反向规划）与多步连续反应库存推演，Decimal/Fraction 精确计算
+  stoichiometry.py  投料量 -> 反应进度（正向批量计量）、目标产量 -> 最小反应进度/理论投料（反向规划）、投料+实际产量 -> 理论/实际/收率百分比（收率计算）与多步连续反应库存推演，Decimal/Fraction 精确计算
   allocation.py     试剂批次 FEFO 领用分配：纯度换算有效物质、跨批拆分、过期/隔离跳过、未满足需求与汇总，Fraction 精确计算
   service.py        业务编排与响应组装
   models.py         Pydantic 请求/响应模型
   main.py           FastAPI 路由与异常处理
-tests/              解析器、配平核心、HTTP API、批量计量、反向投料规划、连续反应推演、试剂批次领用分配共 241 个测试
+tests/              解析器、配平核心、HTTP API、批量计量、反向投料规划、实际收率、连续反应推演、试剂批次领用分配共 267 个测试
 Dockerfile
 docker-compose.yml
 requirements.txt / requirements-dev.txt
